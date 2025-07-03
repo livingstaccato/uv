@@ -4,7 +4,7 @@
 pub(crate) mod common;
 
 mod branching_urls;
-mod pspf;
+mod pspf; // Added for PSPF integration tests
 
 #[cfg(all(feature = "python", feature = "pypi"))]
 mod build;

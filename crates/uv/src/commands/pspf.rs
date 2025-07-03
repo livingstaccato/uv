@@ -1,21 +1,25 @@
 // crates/uv/src/commands/pspf.rs
 
 use std::collections::HashMap;
-use anyhow::Result;
+use std::path::PathBuf;
+use std::env;
+use std::io::Write; // For writeln! on printer
+use anyhow::{Context, Result};
 use tracing::debug;
-use uv_cli::PspfPackageArgs;
+
+use uv_cli::PspfPackageArgs; // Refers to the revised args for self-unwrapping model
 use crate::commands::ExitStatus;
 use crate::printer::Printer;
-use crate::pspf::{PspPackageInputs, ConfigJson};
+use crate::pspf_packager::{PspPackageInputs, create_pspf_package};
+use uv_pspf_format::ConfigJson; // Assuming this is the path after Step 1
 
-/// Package a Python application into PSPF v0.1 format.
+/// Package a Python application into PSPF v0.1 format (self-unwrapping uv).
 pub(crate) async fn pspf_package(
     args: PspfPackageArgs,
-    _printer: Printer, // Keep for consistency, might use later
+    printer: Printer, // Used for outputting success message
 ) -> Result<ExitStatus> {
-    debug!("Packaging application into PSPF format.");
-    debug!("Go launcher: {:?}", args.go_launcher);
-    debug!("UV binary: {:?}", args.uv_binary);
+    debug!("Packaging application into PSPF format (self-unwrapping model).");
+    debug!("UV binary to use as base (if specified): {:?}", args.uv_binary_to_package);
     debug!("Project dir: {:?}", args.project_dir);
     debug!("Output path: {:?}", args.output_path);
     debug!("Private key: {:?}", args.private_key);
@@ -24,6 +28,17 @@ pub(crate) async fn pspf_package(
     debug!("Env mode: {:?}", args.env_mode);
     debug!("Env allowed: {:?}", args.env_allowed);
     debug!("Env set: {:?}", args.env_set);
+
+    let uv_binary_to_package_path = match args.uv_binary_to_package {
+        Some(path) => {
+            if !path.exists() {
+                return Err(anyhow::anyhow!("Specified uv binary to package does not exist: {:?}", path));
+            }
+            path
+        },
+        None => env::current_exe().context("Failed to determine current uv executable path to use as package base")?,
+    };
+    debug!("Using uv binary as base for PSPF: {:?}", uv_binary_to_package_path);
 
     let config_json = ConfigJson {
         entry_point: args.entry_point,
@@ -34,16 +49,22 @@ pub(crate) async fn pspf_package(
     };
 
     let package_inputs = PspPackageInputs {
-        go_launcher_path: &args.go_launcher,
-        uv_binary_path: &args.uv_binary,
+        uv_binary_to_package_path: &uv_binary_to_package_path,
         payload_project_path: &args.project_dir,
         config_json,
         output_path: &args.output_path,
         private_key_pem_path: &args.private_key,
-        // TODO: Pass cache, client, venv if needed by the real `create_payload_tgz`
+        // TODO: When create_payload_tgz is fully implemented, pass Cache, RegistryClientBuilder etc.
     };
 
-    crate::pspf::create_pspf_package(&package_inputs)?;
+    create_pspf_package(&package_inputs)
+        .with_context(|| format!("Failed to create PSPF package at {:?}", args.output_path))?;
+
+    writeln!(
+        printer.stdout(),
+        "Successfully created PSPF package: {}",
+        args.output_path.display()
+    )?;
 
     Ok(ExitStatus::Success)
 }

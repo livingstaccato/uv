@@ -27,7 +27,7 @@ use uv_cli::SelfUpdateArgs;
 use uv_cli::{
     BuildBackendCommand, CacheCommand, CacheNamespace, Cli, Commands, PipCommand, PipNamespace,
     ProjectCommand, PythonCommand, PythonNamespace, SelfCommand, SelfNamespace, ToolCommand,
-    ToolNamespace, TopLevelArgs, compat::CompatArgs, PspfNamespace, PspfCommand,
+    ToolNamespace, TopLevelArgs, compat::CompatArgs,
 };
 use uv_configuration::min_stack_size;
 use uv_fs::{CWD, Simplified};
@@ -56,10 +56,204 @@ pub(crate) mod commands;
 pub(crate) mod logging;
 pub(crate) mod printer;
 pub(crate) mod settings;
-pub mod pspf;
+pub(crate) mod pspf_format;
+
+// Placeholder for the actual PSPF execution logic
+// This will involve file I/O, crypto, and calling uv's own library functions
+// For now, it just checks for a magic string at a fixed offset for demonstration
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use crate::pspf_format::{PSP_FOOTER_SIZE, PSP_EOF_MAGIC, PspFileFooter, PUBLIC_KEY_DER_SIZE, ConfigJson};
+use crate::commands::ExitStatus; // Make sure ExitStatus is accessible
+use anyhow::bail;
+use sha2::{Sha256, Digest};
+use rsa::pkcs8::DecodePublicKey; // For parsing DER public key
+use tempfile::tempdir_in;
+
+
+/// If the current executable is a PSPF package, verify and run it.
+/// Returns `Ok(Some(ExitStatus))` if it was a PSPF and ran (or failed verification).
+/// Returns `Ok(None)` if it's not a PSPF, allowing normal CLI execution.
+fn check_and_run_if_pspf() -> Result<Option<ExitStatus>> {
+    let current_exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return Ok(None), // Cannot determine exe path, proceed as normal CLI
+    };
+
+    let mut file = match File::open(&current_exe_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // Cannot open own exe, proceed as normal CLI
+    };
+
+    let file_size = match file.metadata() {
+        Ok(md) => md.len(),
+        Err(_) => return Ok(None),
+    };
+
+    if file_size < (PSP_FOOTER_SIZE + PSP_EOF_MAGIC.len()) as u64 {
+        return Ok(None); // Too small to be a PSPF
+    }
+
+    // Try to read EOF magic
+    let mut eof_magic_buffer = [0u8; PSP_EOF_MAGIC.len()];
+    if file.seek(SeekFrom::End(-(PSP_EOF_MAGIC.len() as i64))).is_err() { return Ok(None); }
+    if file.read_exact(&mut eof_magic_buffer).is_err() { return Ok(None); }
+
+    if &eof_magic_buffer != PSP_EOF_MAGIC {
+        return Ok(None); // Not a PSPF file by EOF magic
+    }
+
+    // Read and verify footer
+    let mut footer_buffer = [0u8; PSP_FOOTER_SIZE];
+     if file.seek(SeekFrom::End(-((PSP_EOF_MAGIC.len() + PSP_FOOTER_SIZE) as i64))).is_err() {
+        eprintln!("PSPF Error: Failed to seek to footer position.");
+        return Ok(Some(ExitStatus::Failure));
+     }
+    if file.read_exact(&mut footer_buffer).is_err() {
+        eprintln!("PSPF Error: Failed to read footer.");
+        return Ok(Some(ExitStatus::Failure));
+    }
+
+    let footer = match PspFileFooter::from_le_bytes(&footer_buffer) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("PSPF Error: Invalid footer data: {}", e);
+            return Ok(Some(ExitStatus::Failure));
+        }
+    };
+
+    if let Err(e) = footer.verify_internal_consistency() {
+        eprintln!("PSPF Error: Footer consistency check failed: {}", e);
+        return Ok(Some(ExitStatus::Failure));
+    }
+
+    // If we're here, it's very likely a PSPF package.
+    // Now, perform full verification and execution.
+    eprintln!("uv: Detected PSPF package format. Attempting to execute...");
+
+    // 1. Extract Public Key from self (offset 0, fixed size)
+    let mut public_key_der = vec![0u8; PUBLIC_KEY_DER_SIZE];
+    if file.seek(SeekFrom::Start(0)).is_err() || file.read_exact(&mut public_key_der).is_err() {
+        eprintln!("PSPF Error: Failed to read embedded public key.");
+        return Ok(Some(ExitStatus::Failure));
+    }
+    let public_key = match rsa::RsaPublicKey::from_public_key_der(&public_key_der) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("PSPF Error: Failed to parse embedded public key: {}", e);
+            return Ok(Some(ExitStatus::Failure));
+        }
+    };
+
+    // 2. Verify Signature
+    // Signed data: Modified UV Binary (Key + UV code) + Metadata TGZ + Payload TGZ
+    // The Modified UV Binary is from offset 0 up to footer.metadata_tgz_offset
+    // (as uv_binary_offset in footer is 0 relative to start of signed block,
+    // and uv_binary_size is the size of this modified uv binary)
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer for reading
+
+    // Hash Modified UV Binary part
+    if footer.uv_binary_size == 0 { // footer.uv_binary_size is size of modified_uv_binary_bytes
+        eprintln!("PSPF Error: UV binary size in footer is 0.");
+        return Ok(Some(ExitStatus::Failure));
+    }
+    file.seek(SeekFrom::Start(0))?; // footer.uv_binary_offset is 0 for this segment
+    let mut bytes_to_read = footer.uv_binary_size;
+    while bytes_to_read > 0 {
+        let read_len = std::cmp::min(bytes_to_read, buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..read_len])?;
+        hasher.update(&buffer[..read_len]);
+        bytes_to_read -= read_len as u64;
+    }
+
+    // Hash Metadata TGZ
+    if footer.metadata_tgz_size > 0 {
+        file.seek(SeekFrom::Start(footer.metadata_tgz_offset))?;
+        bytes_to_read = footer.metadata_tgz_size;
+        while bytes_to_read > 0 {
+            let read_len = std::cmp::min(bytes_to_read, buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..read_len])?;
+            hasher.update(&buffer[..read_len]);
+            bytes_to_read -= read_len as u64;
+        }
+    }
+
+    // Hash Payload TGZ
+    if footer.payload_tgz_size > 0 {
+        file.seek(SeekFrom::Start(footer.payload_tgz_offset))?;
+        bytes_to_read = footer.payload_tgz_size;
+        while bytes_to_read > 0 {
+            let read_len = std::cmp::min(bytes_to_read, buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..read_len])?;
+            hasher.update(&buffer[..read_len]);
+            bytes_to_read -= read_len as u64;
+        }
+    }
+    let digest = hasher.finalize();
+
+    let mut signature_bytes = vec![0u8; footer.package_signature_size as usize];
+     if footer.package_signature_size == 0 {
+        eprintln!("PSPF Error: Package signature size is 0.");
+        return Ok(Some(ExitStatus::Failure));
+    }
+    file.seek(SeekFrom::Start(footer.package_signature_offset))?;
+    file.read_exact(&mut signature_bytes)?;
+
+    let verifying_key = rsa::pss::VerifyingKey::<rsa::sha2::Sha256>::new(public_key);
+    if verifying_key.verify(&digest, &signature_bytes).is_err() {
+        eprintln!("PSPF Error: Signature verification failed.");
+        return Ok(Some(ExitStatus::Failure));
+    }
+    eprintln!("uv: PSPF signature verified.");
+
+    // 3. Execution (Placeholder for now - this is complex)
+    //    - Create temp dir
+    //    - Extract metadata.tgz, payload.tgz from self (file) to temp dir
+    //    - Parse config.json
+    //    - Use *this* uv's library functions (uv_virtualenv, uv_installer)
+    //        - Create venv in temp_dir/venv
+    //        - Install wheels from temp_dir/payload/* into temp_dir/venv
+    //    - Execute Python entry point
+    //    - Clean up temp dir
+    eprintln!("uv: PSPF payload execution would start here (currently placeholder).");
+    eprintln!("uv: Config - EntryPoint: (Not yet parsed), Python: (Not yet parsed)");
+    // Simulate successful placeholder execution for now
+    return Ok(Some(ExitStatus::Success));
+
+    // If full execution were implemented:
+    // match pspf_execute_payload(&mut file, &footer, &current_exe_path) {
+    //     Ok(exit_code) => Ok(Some(ExitStatus::External(exit_code))),
+    //     Err(e) => {
+    //         eprintln!("PSPF Execution Error: {}", e);
+    //         Ok(Some(ExitStatus::Failure))
+    //     }
+    // }
+}
+
+// Placeholder for actual execution logic
+// fn pspf_execute_payload(
+//     pspf_file: &mut File,
+//     footer: &PspFileFooter,
+//     current_exe_path: &Path, // This is the path to this uv binary
+// ) -> Result<u8> {
+//     // ... detailed implementation of extraction, venv creation, install, run ...
+//     bail!("PSPF execution not fully implemented yet")
+// }
+
 
 #[instrument(skip_all)]
 async fn run(mut cli: Cli) -> Result<ExitStatus> {
+    // Attempt to run as PSPF first
+    match check_and_run_if_pspf() {
+        Ok(Some(exit_status)) => return Ok(exit_status), // PSPF mode handled, exit
+        Ok(None) => { /* Not a PSPF or failed to check, proceed as normal CLI */ }
+        Err(e) => { // Should not happen if check_and_run_if_pspf handles its errors by returning Some(ExitStatus)
+            eprintln!("Error during PSPF check: {}. Proceeding as normal CLI.", e);
+        }
+    }
+
     // Enable flag to pick up warnings generated by workspace loading.
     if cli.top_level.global_args.quiet == 0 {
         uv_warnings::enable();
@@ -1643,20 +1837,6 @@ async fn run(mut cli: Cli) -> Result<ExitStatus> {
         })
         .await
         .expect("tokio threadpool exited unexpectedly"),
-        Commands::Pspf(PspfNamespace {
-            command: PspfCommand::Package(args),
-        }) => {
-            // Resolve the settings from the command-line arguments and workspace configuration.
-            // For PSPF, we might not need complex settings resolution like other commands,
-            // but this is a placeholder if we decide to add pspf-specific settings to uv.toml.
-            // let args = settings::PspfPackageSettings::resolve(args, filesystem);
-            // show_settings!(args);
-
-            // PSPF might not need cache in the same way, but keeping pattern if needed later.
-            // let cache = cache.init()?;
-
-            commands::pspf::pspf_package(*args, printer).await
-        }
     }
 }
 

@@ -29,6 +29,7 @@ uv [OPTIONS] <COMMAND>
 <dt><a href="#uv-publish"><code>uv publish</code></a></dt><dd><p>Upload distributions to an index</p></dd>
 <dt><a href="#uv-cache"><code>uv cache</code></a></dt><dd><p>Manage uv's cache</p></dd>
 <dt><a href="#uv-self"><code>uv self</code></a></dt><dd><p>Manage the uv executable</p></dd>
+<dt><a href="#uv-pspf"><code>uv pspf</code></a></dt><dd><p>Package Python projects into Pyvider Secure Package Format (PSPF) files</p></dd>
 <dt><a href="#uv-help"><code>uv help</code></a></dt><dd><p>Display documentation for a command</p></dd>
 </dl>
 
@@ -3146,72 +3147,6 @@ uv python uninstall [OPTIONS] <TARGETS>...
 <p>You can configure fine-grained logging using the <code>RUST_LOG</code> environment variable. (<a href="https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives">https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives</a>)</p>
 </dd></dl>
 
-## uv pspf
-
-Manage Pyvider Secure Package Format (PSPF) files.
-
-The PSPF format (v0.1) is designed for secure, self-contained distribution of Python applications. It uses a "verify-then-run" model where the entire package (launcher, embedded UV, metadata, Python payload, and signature) is cryptographically signed. The launcher verifies this signature before any execution.
-
-<h3 class="cli-reference">Usage</h3>
-
-```
-uv pspf [OPTIONS] <COMMAND>
-```
-
-<h3 class="cli-reference">Commands</h3>
-
-<dl class="cli-reference"><dt><a href="#uv-pspf-package"><code>uv pspf package</code></a></dt><dd><p>Package a Python application into PSPF v0.1 format</p></dd>
-</dl>
-
-### uv pspf package
-
-Package a Python application into PSPF v0.1 format.
-
-This command assembles a Python application, its dependencies, an embedded `uv` binary, and a provided launcher executable into a single, signed PSPF file.
-
-<h3 class="cli-reference">Usage</h3>
-
-```
-uv pspf package [OPTIONS] --go-launcher <LAUNCHER_PATH> --uv-binary <UV_BINARY_PATH> --project-dir <PROJECT_DIR_PATH> --output-path <OUTPUT_PSPF_PATH> --private-key <PRIVATE_KEY_PATH> --entry-point <ENTRY_POINT> --python-version <PYTHON_VERSION>
-```
-
-<h3 class="cli-reference">Options</h3>
-
-<dl class="cli-reference">
-<dt id="uv-pspf-package--launcher-path"><a href="#uv-pspf-package--launcher-path"><code>--launcher-path</code></a> <i>launcher-path</i></dt><dd><p>Path to the pre-compiled launcher binary that will be embedded at the start of the PSPF file. This launcher is responsible for verifying the package integrity and setting up the execution environment.</p></dd>
-<dt id="uv-pspf-package--uv-binary"><a href="#uv-pspf-package--uv-binary"><code>--uv-binary</code></a> <i>uv-binary-path</i></dt><dd><p>Path to the <code>uv</code> binary that will be embedded within the PSPF package. This embedded <code>uv</code> is used by the launcher to create the virtual environment and install payload dependencies.</p></dd>
-<dt id="uv-pspf-package--project-dir"><a href="#uv-pspf-package--project-dir"><code>--project-dir</code></a> <i>project-dir-path</i></dt><dd><p>Path to the Python project directory to be packaged. <code>uv</code> will resolve and bundle dependencies for this project.</p></dd>
-<dt id="uv-pspf-package--output-path"><a href="#uv-pspf-package--output-path"><code>--output-path</code></a>, <code>-o</code> <i>output-pspf-path</i></dt><dd><p>Path where the final <code>.pspf</code> file will be written.</p></dd>
-<dt id="uv-pspf-package--private-key"><a href="#uv-pspf-package--private-key"><code>--private-key</code></a> <i>private-key-path</i></dt><dd><p>Path to the RSA private key in PEM format used for signing the package. An RSA 4096-bit key is recommended as per the PSPF v0.1 specification.</p></dd>
-<dt id="uv-pspf-package--entry-point"><a href="#uv-pspf-package--entry-point"><code>--entry-point</code></a> <i>entry-point</i></dt><dd><p>The entry point for the Python application, formatted as "module.path:function_name" (e.g., <code>"my_app.cli:main"</code>). This is written into the <code>config.json</code> within the package.</p></dd>
-<dt id="uv-pspf-package--python-version"><a href="#uv-pspf-package--python-version"><code>--python-version</code></a> <i>python-version</i></dt><dd><p>The Python version string (e.g., <code>"python3.11"</code>, <code>"3.10"</code>) that the embedded <code>uv</code> should use to create the virtual environment. This is written into <code>config.json</code>.</p></dd>
-<dt id="uv-pspf-package--env-mode"><a href="#uv-pspf-package--env-mode"><code>--env-mode</code></a> <i>env-mode</i></dt><dd><p>Environment variable policy for the Python process. Can be <code>"restricted"</code> (default if unspecified by user, but no default in command) or <code>"passthrough"</code>. This is written into <code>config.json</code>.</p>
-<p>Possible values:</p>
-<ul>
-<li><code>restricted</code>: Only pass environment variables specified in <code>--env-allowed</code> or set by <code>--env-set</code>.</li>
-<li><code>passthrough</code>: Pass all environment variables from the launcher's environment to the Python process. Variables in <code>--env-set</code> will still take precedence.</li>
-</ul></dd>
-<dt id="uv-pspf-package--env-allowed"><a href="#uv-pspf-package--env-allowed"><code>--env-allowed</code></a> <i>env-var1,env-var2,...</i></dt><dd><p>Comma-separated list of environment variable names to allow if <code>--env-mode</code> is <code>"restricted"</code>. This is written into <code>config.json</code>.</p></dd>
-<dt id="uv-pspf-package--env-set"><a href="#uv-pspf-package--env-set"><code>--env-set</code></a> <i>KEY1=VALUE1,KEY2=VALUE2,...</i></dt><dd><p>Comma-separated list of <code>KEY=VALUE</code> pairs to force-set as environment variables for the Python process. These take precedence over allowed or passthrough variables. This is written into <code>config.json</code>.</p></dd>
-<dt id="uv-pspf-package--help"><a href="#uv-pspf-package--help"><code>--help</code></a>, <code>-h</code></dt><dd><p>Display the concise help for this command.</p></dd>
-</dl>
-
-<h4 class="cli-reference">Example</h4>
-
-```bash
-uv pspf package \\
-    --launcher-path ./my_launcher_executable \\
-    --uv-binary /path/to/uv \\
-    --project-dir ./my_python_app_source \\
-    --output-path ./my_application.pspf \\
-    --private-key ./keys/pspf_private.pem \\
-    --entry-point "my_python_app.main:start" \\
-    --python-version "python3.11" \\
-    --env-mode "restricted" \\
-    --env-allowed "PATH,HOME,MY_CUSTOM_VAR" \\
-    --env-set "PYTHONUNBUFFERED=1,LOG_LEVEL=INFO"
-```
-
 ## uv pip
 
 Manage Python packages with a pip-compatible interface
@@ -5362,6 +5297,69 @@ uv self version [OPTIONS]
 </dd><dt id="uv-self-version--verbose"><a href="#uv-self-version--verbose"><code>--verbose</code></a>, <code>-v</code></dt><dd><p>Use verbose output.</p>
 <p>You can configure fine-grained logging using the <code>RUST_LOG</code> environment variable. (<a href="https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives">https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives</a>)</p>
 </dd></dl>
+
+## uv pspf
+
+Package Python projects into Pyvider Secure Package Format (PSPF) files.
+
+PSPF is a format designed for secure, self-contained distribution of Python applications.
+The `uv pspf package` command creates a PSPF file by bundling a Python project, its
+dependencies, an embedded `uv` binary, and necessary metadata. The entire package is
+signed, and when executed, `uv` (acting as the launcher) verifies the signature before
+extracting and running the Python payload.
+
+<h3 class="cli-reference">Usage</h3>
+
+```
+uv pspf <COMMAND>
+```
+
+<h3 class="cli-reference">Commands</h3>
+
+<dl class="cli-reference"><dt><a href="#uv-pspf-package"><code>uv pspf package</code></a></dt><dd><p>Package a Python project into a PSPF file.</p></dd>
+</dl>
+
+### uv pspf package
+
+Package a Python project into a PSPF file.
+
+This command takes a Python project (specified by `--project-dir`), a path to a `uv`
+binary to embed (or uses the currently running `uv` binary by default), a private key
+for signing, and a corresponding public key. It creates `metadata.tgz` (containing
+`config.json`) and `payload.tgz` (containing project wheels), signs these along with
+the embedded `uv` binary and the public key, and assembles them into a single
+executable PSPF file as specified in PSPF v0.1.
+
+The `config.json` within `metadata.tgz` controls the Python execution environment.
+
+<h3 class="cli-reference">Usage</h3>
+
+```
+uv pspf package [OPTIONS] --project-dir <PROJECT_DIR> --private-key-path <PRIVATE_KEY_PATH> --public-key-path <PUBLIC_KEY_PATH> --output-file <OUTPUT_FILE>
+```
+
+<h3 class="cli-reference">Options</h3>
+
+<dl class="cli-reference">
+<dt id="uv-pspf-package--project-dir"><a href="#uv-pspf-package--project-dir"><code>--project-dir</code></a> <i>project-dir</i></dt><dd><p>Path to the Python project directory to package. This directory should contain a <code>pyproject.toml</code> or be otherwise buildable by `uv wheel`.</p></dd>
+<dt id="uv-pspf-package--private-key-path"><a href="#uv-pspf-package--private-key-path"><code>--private-key-path</code></a> <i>private-key-path</i></dt><dd><p>Path to the PKCS#8 PEM-encoded RSA private key (4096-bit) used for signing the package.</p></dd>
+<dt id="uv-pspf-package--public-key-path"><a href="#uv-pspf-package--public-key-path"><code>--public-key-path</code></a> <i>public-key-path</i></dt><dd><p>Path to the PKCS#8 PEM-encoded RSA public key (4096-bit) corresponding to the private key. This public key will be embedded into the PSPF for verification by the launcher.</p></dd>
+<dt id="uv-pspf-package--output-file"><a href="#uv-pspf-package--output-file"><code>--output-file</code></a>, <code>-o</code> <i>output-file</i></dt><dd><p>Path where the final PSPF package will be written.</p></dd>
+<dt id="uv-pspf-package--uv-binary-to-package"><a href="#uv-pspf-package--uv-binary-to-package"><code>--uv-binary-to-package</code></a> <i>uv-binary-to-package</i></dt><dd><p>Path to the `uv` binary to be embedded in the PSPF package. If not provided, the currently running `uv` executable will be used. This binary will act as both the launcher and the embedded `uv` instance for environment creation.</p></dd>
+<dt id="uv-pspf-package--entry-point"><a href="#uv-pspf-package--entry-point"><code>--entry-point</code></a> <i>entry-point</i></dt><dd><p>The Python entry point for the application. Format: "module.path:function_name". This is REQUIRED and will be written to `config.json`.</p></dd>
+<dt id="uv-pspf-package--python-version-req"><a href="#uv-pspf-package--python-version-req"><code>--python-version-req</code></a> <i>python-version-req</i></dt><dd><p>The Python interpreter version to request when creating the virtual environment (e.g., "python3.11", "python3"). This is REQUIRED and will be written to `config.json`.</p></dd>
+<dt id="uv-pspf-package--env-mode"><a href="#uv-pspf-package--env-mode"><code>--env-mode</code></a> <i>env-mode</i></dt><dd><p>Environment variable policy. Can be "restricted" (default) or "passthrough". Written to `config.json`.</p><p>Possible values: <code>restricted</code>, <code>passthrough</code>.</p></dd>
+<dt id="uv-pspf-package--env-allowed"><a href="#uv-pspf-package--env-allowed"><code>--env-allowed</code></a> <i>env-allowed</i></dt><dd><p>Whitelist of environment variables to pass to the Python process if `env-mode` is "restricted". Example: `ALLOWED_VAR1,ALLOWED_VAR2`. Written to `config.json`.</p></dd>
+<dt id="uv-pspf-package--env-set"><a href="#uv-pspf-package--env-set"><code>--env-set</code></a> <i>env-set</i></dt><dd><p>Key-value pairs of environment variables to force-set for the Python process. Example: `KEY1=VALUE1,KEY2=VALUE2`. Written to `config.json`.</p></dd>
+<dt id="uv-pspf-package--prelude"><a href="#uv-pspf-package--prelude"><code>--prelude</code></a> <i>prelude</i></dt><dd><p>A short text prelude to prepend to the PSPF file. Useful for shebangs (e.g., `#!/usr/bin/env sh`).</p></dd>
+<dt id="uv-pspf-package--cache-dir"><a href="#uv-pspf-package--cache-dir"><code>--cache-dir</code></a> <i>cache-dir</i></dt><dd><p>Path to the cache directory. Defaults to uv's standard cache location.</p></dd>
+<dt id="uv-pspf-package--color"><a href="#uv-pspf-package--color"><code>--color</code></a> <i>color-choice</i></dt><dd><p>Control color output. Possible values: <code>auto</code>, <code>always</code>, <code>never</code>.</p></dd>
+<dt id="uv-pspf-package--native-tls"><a href="#uv-pspf-package--native-tls"><code>--native-tls</code></a></dt><dd><p>Use the platform's native TLS certificate store.</p></dd>
+<dt id="uv-pspf-package--offline"><a href="#uv-pspf-package--offline"><code>--offline</code></a></dt><dd><p>Disable network access for building the payload wheels.</p></dd>
+<dt id="uv-pspf-package--quiet"><a href="#uv-pspf-package--quiet"><code>--quiet</code></a>, <code>-q</code></dt><dd><p>Use quiet output.</p></dd>
+<dt id="uv-pspf-package--verbose"><a href="#uv-pspf-package--verbose"><code>--verbose</code></a>, <code>-v</code></dt><dd><p>Use verbose output.</p></dd>
+<dt id="uv-pspf-package--help"><a href="#uv-pspf-package--help"><code>--help</code></a>, <code>-h</code></dt><dd><p>Display the concise help for this command.</p></dd>
+</dl>
 
 ## uv generate-shell-completion
 
