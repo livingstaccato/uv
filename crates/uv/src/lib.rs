@@ -27,7 +27,7 @@ use uv_cli::SelfUpdateArgs;
 use uv_cli::{
     BuildBackendCommand, CacheCommand, CacheNamespace, Cli, Commands, PipCommand, PipNamespace,
     ProjectCommand, PythonCommand, PythonNamespace, SelfCommand, SelfNamespace, ToolCommand,
-    ToolNamespace, TopLevelArgs, compat::CompatArgs,
+    ToolNamespace, TopLevelArgs, compat::CompatArgs, PspfNamespace, PspfCommand,
 };
 use uv_configuration::min_stack_size;
 use uv_fs::{CWD, Simplified};
@@ -56,6 +56,7 @@ pub(crate) mod commands;
 pub(crate) mod logging;
 pub(crate) mod printer;
 pub(crate) mod settings;
+pub mod pspf;
 
 #[instrument(skip_all)]
 async fn run(mut cli: Cli) -> Result<ExitStatus> {
@@ -1642,6 +1643,20 @@ async fn run(mut cli: Cli) -> Result<ExitStatus> {
         })
         .await
         .expect("tokio threadpool exited unexpectedly"),
+        Commands::Pspf(PspfNamespace {
+            command: PspfCommand::Package(args),
+        }) => {
+            // Resolve the settings from the command-line arguments and workspace configuration.
+            // For PSPF, we might not need complex settings resolution like other commands,
+            // but this is a placeholder if we decide to add pspf-specific settings to uv.toml.
+            // let args = settings::PspfPackageSettings::resolve(args, filesystem);
+            // show_settings!(args);
+
+            // PSPF might not need cache in the same way, but keeping pattern if needed later.
+            // let cache = cache.init()?;
+
+            commands::pspf::pspf_package(*args, printer).await
+        }
     }
 }
 

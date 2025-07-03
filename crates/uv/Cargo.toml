@@ -24,6 +24,7 @@ uv-cli = { workspace = true }
 uv-client = { workspace = true }
 uv-configuration = { workspace = true }
 uv-console = { workspace = true }
+crc32fast = "1.4"
 uv-dirs = { workspace = true }
 uv-dispatch = { workspace = true }
 uv-distribution = { workspace = true }
@@ -83,12 +84,15 @@ jiff = { workspace = true }
 miette = { workspace = true, features = ["fancy-no-backtrace"] }
 owo-colors = { workspace = true }
 petgraph = { workspace = true }
+rand = "0.8"
 regex = { workspace = true }
 reqwest = { workspace = true }
 rkyv = { workspace = true }
+rsa = { version = "0.9", features = ["pss"] }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tempfile = { workspace = true }
 textwrap = { workspace = true }
 thiserror = { workspace = true }

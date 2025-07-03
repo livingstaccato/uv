@@ -511,6 +511,12 @@ pub enum Commands {
         ),
     )]
     Help(HelpArgs),
+    /// Manage Pyvider Secure Packages (PSPF).
+    #[command(
+        after_help = "Use `uv help pspf` for more details.",
+        after_long_help = ""
+    )]
+    Pspf(PspfNamespace),
 }
 
 #[derive(Args, Debug)]
@@ -6004,4 +6010,68 @@ pub enum BuildBackendCommand {
     GetRequiresForBuildEditable,
     /// PEP 660 hook `prepare_metadata_for_build_editable`.
     PrepareMetadataForBuildEditable { wheel_directory: PathBuf },
+}
+
+#[derive(Args)]
+pub struct PspfNamespace {
+    #[command(subcommand)]
+    pub command: PspfCommand,
+}
+
+#[derive(Subcommand)]
+pub enum PspfCommand {
+    /// Package a Python application into PSPF v0.1 format.
+    Package(Box<PspfPackageArgs>),
+}
+
+#[derive(Args, Debug)]
+pub struct PspfPackageArgs {
+    /// Path to the pre-compiled Go launcher binary.
+    #[arg(long, required = true)]
+    pub go_launcher: PathBuf,
+
+    /// Path to the `uv` binary to embed.
+    #[arg(long, required = true)]
+    pub uv_binary: PathBuf,
+
+    /// Path to the Python project directory to package.
+    #[arg(long, required = true)]
+    pub project_dir: PathBuf,
+
+    /// Path to the output PSPF file.
+    #[arg(long, short, required = true)]
+    pub output_path: PathBuf,
+
+    /// Path to the RSA private key (PEM format) for signing. (4096-bit key recommended)
+    #[arg(long, required = true)]
+    pub private_key: PathBuf,
+
+    /// Entry point for the Python application (e.g., "module.path:function_name").
+    #[arg(long, required = true)]
+    pub entry_point: String,
+
+    /// Python version to request for the virtual environment (e.g., "python3.11").
+    #[arg(long, required = true)]
+    pub python_version: String,
+
+    /// Environment variable mode for the Python process ("restricted" or "passthrough").
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["restricted", "passthrough"]).map(|s| s.to_lowercase()))]
+    pub env_mode: Option<String>,
+
+    /// Whitelisted environment variables if mode is "restricted" (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub env_allowed: Option<Vec<String>>,
+
+    /// Environment variables to force-set for the Python process (KEY=VALUE, comma-separated).
+    #[arg(long, value_parser = parse_key_value_pairs, value_delimiter = ',')]
+    pub env_set: Option<Vec<(String, String)>>,
+    // TODO: Add arguments for any other necessary inputs like cache, client builder, etc.
+    // if they can't be inferred or globally provided.
+}
+
+// Helper function to parse KEY=VALUE pairs
+fn parse_key_value_pairs(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .ok_or_else(|| format!("invalid KEY=VALUE pair: {s}"))
 }

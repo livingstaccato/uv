@@ -4,6 +4,7 @@
 pub(crate) mod common;
 
 mod branching_urls;
+mod pspf;
 
 #[cfg(all(feature = "python", feature = "pypi"))]
 mod build;

@@ -61,6 +61,7 @@ pub(crate) use venv::venv;
 use crate::printer::Printer;
 
 pub(crate) mod build_backend;
+pub(crate) mod pspf;
 mod build_frontend;
 mod cache_clean;
 mod cache_dir;
