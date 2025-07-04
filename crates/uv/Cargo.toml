@@ -98,8 +98,14 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-durations-export = { workspace = true, features = ["plot"], optional = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
+byteorder = { workspace = true }
+crc32fast = { workspace = true }
 tracing-tree = { workspace = true }
 unicode-width = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] } # For RSA signing and key manipulation
+sha2 = { workspace = true } # For SHA256 hashing
+tar = { workspace = true } # For creating tarballs
+# flate2 is already a workspace dependency, but ensure it's available for gzip
 url = { workspace = true }
 version-ranges = { workspace = true }
 walkdir = { workspace = true }

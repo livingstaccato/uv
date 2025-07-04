@@ -511,6 +511,12 @@ pub enum Commands {
         ),
     )]
     Help(HelpArgs),
+    /// Package and sign Python applications into a Pyvider Secure Package Format (PSPF) file.
+    #[command(
+        after_help = "Use `uv help pspf` for more details.",
+        after_long_help = ""
+    )]
+    PsPf(Box<PsPfNamespace>),
 }
 
 #[derive(Args, Debug)]
@@ -6004,4 +6010,47 @@ pub enum BuildBackendCommand {
     GetRequiresForBuildEditable,
     /// PEP 660 hook `prepare_metadata_for_build_editable`.
     PrepareMetadataForBuildEditable { wheel_directory: PathBuf },
+}
+
+// PSPF Command Namespace
+#[derive(Args, Debug)]
+pub struct PsPfNamespace {
+    #[command(subcommand)]
+    pub command: PsPfCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PsPfCommand {
+    /// Package a Python project into a PSPF file.
+    Package(Box<PsPfPackageArgs>),
+}
+
+#[derive(Args, Debug)]
+pub struct PsPfPackageArgs {
+    /// Path to the Python project directory to package.
+    pub project_path: PathBuf,
+
+    /// The application entry point, e.g., `module.main:run`.
+    #[arg(long, short)]
+    pub entry_point: String,
+
+    /// Path to the private key (PEM format) for signing the package.
+    #[arg(long)]
+    pub private_key: PathBuf,
+
+    /// Path to a specific `uv` binary to use as the base for the PSPF package.
+    /// Defaults to the currently running `uv` binary.
+    #[arg(long)]
+    pub uv_bin: Option<PathBuf>,
+
+    /// Environment variables to embed in the package, in `KEY=VALUE` format.
+    /// Can be specified multiple times.
+    #[arg(long, short)]
+    pub env: Vec<String>,
+
+    /// Path to the output PSPF file.
+    /// If not specified, defaults to `<project_name>.pspf` in the current directory.
+    #[arg(long, short)]
+    pub output: Option<PathBuf>,
+    // TODO: Add other necessary arguments from the specification, e.g. python version if not autodetected
 }

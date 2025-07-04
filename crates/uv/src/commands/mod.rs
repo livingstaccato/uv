@@ -48,6 +48,7 @@ pub(crate) use tool::run::run as tool_run;
 pub(crate) use tool::uninstall::uninstall as tool_uninstall;
 pub(crate) use tool::update_shell::update_shell as tool_update_shell;
 pub(crate) use tool::upgrade::upgrade as tool_upgrade;
+pub(crate) use pspf::pspf_package; // Added for PSPF
 use uv_cache::Cache;
 use uv_configuration::Concurrency;
 use uv_distribution_types::InstalledMetadata;
@@ -77,6 +78,7 @@ mod run;
 mod self_update;
 mod tool;
 mod venv;
+mod pspf; // Added for PSPF
 
 #[derive(Copy, Clone)]
 pub(crate) enum ExitStatus {
