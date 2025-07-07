@@ -2225,16 +2225,18 @@ async fn execute_pspf_package(exe_path: &Path, footer: PspFileFooterV1) -> Resul
     // A more robust way would be to store the actual key size or use a self-describing format.
     // For this example, let's assume the key read is the exact DER bytes needed.
     // We'll need to parse it to an RsaPublicKey.
-    // let public_key = RsaPublicKey::from_public_key_der(&public_key_data_padded) // This might need trimming of padding
-    //    .context("Failed to parse embedded public key DER")?;
-    // Placeholder: Use a known test key or fail for now, actual key parsing is complex.
-    // For now, we cannot proceed without a valid public key object.
-    // This part needs actual RSA key parsing logic.
-    warn_user_once!("Public key extraction and parsing is not fully implemented. Using placeholder logic.");
-    // let public_key: RsaPublicKey = ... (This needs to be properly loaded and parsed)
-    // For the sake of structure, let's assume we have it.
-    // If we can't get a key here, we must fail.
-    // bail!("Public key handling not yet implemented for execution flow.");
+
+    // Trim trailing zeros from public_key_data_padded to get the actual DER data
+    // This is a simplification; a robust solution would parse DER TLV structure.
+    let mut actual_key_len = public_key_data_padded.len();
+    while actual_key_len > 0 && public_key_data_padded[actual_key_len - 1] == 0 {
+        actual_key_len -= 1;
+    }
+    let public_key_der = &public_key_data_padded[..actual_key_len];
+
+    let public_key = RsaPublicKey::from_pkcs1_der(public_key_der)
+        .context("Failed to parse embedded PKCS#1 DER public key. The key may be corrupted or not in the expected format.")?;
+    debug!("Successfully parsed embedded public key.");
 
 
     // 2. Read Footer - Already done, `footer` is passed in.
@@ -2278,31 +2280,302 @@ async fn execute_pspf_package(exe_path: &Path, footer: PspFileFooterV1) -> Resul
     pspf_file.read_exact(&mut signature_bytes)
         .context("Failed to read signature from PSPF file")?;
 
-    // Placeholder for actual signature verification
-    // let padding = rsa::pss::Pss::new::<Sha256>(); // RSA-PSS with SHA256
-    // public_key.verify(padding, &computed_hash, &signature_bytes)
-    //     .context("Signature verification failed: The package is corrupted or has been tampered with.")?;
+    // Actual signature verification using RSA-PSS
+    let padding_scheme = rsa::pss::Pss::new::<Sha256>();
+    public_key.verify(padding_scheme, &computed_hash, &signature_bytes)
+        .map_err(|e| {
+            debug!("Signature verification error details: {:?}", e); // Log the specific crypto error
+            anyhow::anyhow!("Package signature verification failed! The package may be corrupted or tampered with. Please ensure it comes from a trusted source.")
+        })?;
 
-    // TEMPORARY: Simulate verification failure/success for testing structure
-    // In a real scenario, this would use the actual public_key object and rsa::signature::Verifier
-    let placeholder_signature_is_valid = true; // Change to false to test failure path
-    if !placeholder_signature_is_valid {
-         eprintln!("{}", "Error: Package signature verification failed! The package may be corrupted or tampered with.".red().bold());
-         return Ok(ExitStatus::Failure); // Or a more specific error code
+use serde::Deserialize; // For deserializing config.json
+use std::collections::HashMap; // For environment variables in config
+use flate2::read::GzDecoder; // For decompressing .tgz
+use tar::Archive; // For unpacking .tar
+use tempfile::tempdir_in; // For creating temporary directories
+use uv_configuration::{BuildOptions, Concurrency, IndexLocations, KeyringProviderType, NetworkSettings, PreviewMode};
+use uv_python::{Interpreter, PythonPreference, EnvironmentPreference, find_best_interpreter};
+use uv_virtualenv::create_virtualenv;
+use uv_installer::{Installer, LinkMode, SitePackages};
+use uv_client::BaseClientBuilder;
+
+
+// Define the structure for config.json (if not already defined or imported globally)
+#[derive(Deserialize, Debug)]
+struct PspConfig {
+    entry_point: String,
+    python_version: Option<String>,
+    env_vars: Option<HashMap<String, String>>,
+}
+
+
+// PSPF execution logic (continuation)
+/// Handles the "verify-then-run" sequence for a PSPF package.
+///
+/// This function is called when `uv` starts and detects it's running as a PSPF package.
+/// It performs the following steps:
+/// 1. Extracts and parses the embedded public key.
+/// 2. Reads data offsets and sizes from the provided `footer`.
+/// 3. Computes a SHA-256 hash of the (uv binary portion + metadata.tgz + payload.tgz).
+/// 4. Verifies the package signature using the public key and the computed hash.
+/// 5. If verification succeeds:
+///    a. Extracts `metadata.tgz` and `payload.tgz` to a temporary directory.
+///    b. Parses `config.json` from the metadata.
+///    c. Creates a temporary Python virtual environment based on `config.json`. (Partially placeholder)
+///    d. Installs wheels from `payload.tgz` into the venv. (Major placeholder)
+///    e. Executes the application specified in `config.json`. (Basic logic in place)
+///
+/// If verification fails at any point, the process terminates with an error.
+async fn execute_pspf_package(exe_path: &Path, footer: PspFileFooterV1) -> Result<ExitStatus> {
+    debug!("Starting PSPF execution for: {}", exe_path.display());
+    eprintln!("PSPF Execution Mode Detected."); // User-facing message
+
+    let mut pspf_file = File::open(exe_path)
+        .with_context(|| format!("Failed to open PSPF file for execution: {}", exe_path.display()))?;
+
+    // --- Verification Phase ---
+
+    // 1. Extract Public Key
+    // The public key is embedded at a fixed offset and padded with trailing zeros
+    // up to PUBLIC_KEY_MAX_SIZE.
+    debug!("Extracting embedded public key...");
+    let mut public_key_data_padded = vec![0u8; pspf_format::PUBLIC_KEY_MAX_SIZE];
+    pspf_file.seek(SeekFrom::Start(pspf_format::PUBLIC_KEY_EMBED_OFFSET))
+        .context("Failed to seek to public key offset in PSPF file")?;
+    pspf_file.read_exact(&mut public_key_data_padded)
+        .context("Failed to read embedded public key data")?;
+
+    // Trim trailing zeros to get the actual DER data.
+    // TODO: This is a simplification; a robust solution would parse DER TLV structure to find the exact length.
+    let mut actual_key_len = public_key_data_padded.len();
+    while actual_key_len > 0 && public_key_data_padded[actual_key_len - 1] == 0 {
+        actual_key_len -= 1;
     }
-    warn_user_once!("Signature verification is not fully implemented. Using placeholder logic.");
+    let public_key_der = &public_key_data_padded[..actual_key_len];
+    if public_key_der.is_empty() {
+        bail!("Embedded public key data is all zeros or empty after trimming.");
+    }
 
+    let public_key = RsaPublicKey::from_pkcs1_der(public_key_der)
+        .context("Failed to parse embedded PKCS#1 DER public key. The key may be corrupted or not in the expected format.")?;
+    debug!("Successfully parsed embedded public key ({} bytes DER).", public_key_der.len());
 
+    // 2. Read Footer - Already done, `footer` is passed in and its checksum verified by `check_pspf_payload`.
+
+    // 3. Hash Content (uv_binary_portion + metadata.tgz + payload.tgz)
+    // The `uv_binary_size` from the footer indicates the length of the initial
+    // part of the file that includes the uv executable and the embedded public key.
+    let mut hasher = Sha256::new();
+    pspf_file.seek(SeekFrom::Start(0))?;
+    let mut binary_reader = BufReader::new(&mut pspf_file).take(footer.uv_binary_size);
+    std::io::copy(&mut binary_reader, &mut hasher)?;
+    drop(binary_reader);
+    pspf_file.seek(SeekFrom::Start(footer.metadata_offset))?;
+    let mut metadata_reader = BufReader::new(&mut pspf_file).take(footer.metadata_size);
+    std::io::copy(&mut metadata_reader, &mut hasher)?;
+    drop(metadata_reader);
+    pspf_file.seek(SeekFrom::Start(footer.payload_offset))?;
+    let mut payload_reader = BufReader::new(&mut pspf_file).take(footer.payload_size);
+    std::io::copy(&mut payload_reader, &mut hasher)?;
+    drop(payload_reader);
+    let computed_hash = hasher.finalize();
+
+    // 4. Verify Signature (already implemented and verified)
+    let mut signature_bytes = vec![0u8; footer.signature_size as usize];
+    pspf_file.seek(SeekFrom::Start(footer.signature_offset))?;
+    pspf_file.read_exact(&mut signature_bytes)?;
+    let padding_scheme = rsa::pss::Pss::new::<Sha256>();
+    public_key.verify(padding_scheme, &computed_hash, &signature_bytes)
+        .map_err(|e| {
+            debug!("Signature verification error details: {:?}", e);
+            anyhow::anyhow!("Package signature verification failed!")
+        })?;
     eprintln!("{}", "Package integrity and authenticity verified successfully.".green());
 
-    // TODO: 6. Extract Archives (metadata.tgz, payload.tgz)
-    // TODO: 7. Create Environment
-    // TODO: 8. Install Payload
-    // TODO: 9. Run Application
+    // Setup minimal context for execution phase
+    // TODO: These defaults might need to become configurable for PSPF context
+    let printer = Printer::Default;
+    let cache_dir = uv_dirs::cache_dir()?.join("pspf_run_cache"); // Use a dedicated sub-cache
+    fs_err::create_dir_all(&cache_dir).context("Failed to create PSPF run cache directory")?;
+    let cache = Cache::init(cache_dir)
+        .context("Failed to initialize cache for PSPF execution")?;
 
-    eprintln!("PSPF execution beyond verification is not yet implemented.");
-    Ok(ExitStatus::Success)
+    let temp_extraction_dir = tempdir_in(cache.root()) // Place temp dir inside our cache
+        .context("Failed to create temporary directory for PSPF extraction")?;
+    debug!("Created temporary extraction directory: {}", temp_extraction_dir.path().display());
+
+    // 6. Extract Archives
+    let metadata_path = temp_extraction_dir.path().join("metadata");
+    fs_err::create_dir_all(&metadata_path)?;
+    pspf_file.seek(SeekFrom::Start(footer.metadata_offset))?;
+    let mut metadata_tgz_reader = BufReader::new(&mut pspf_file).take(footer.metadata_size);
+    Archive::new(GzDecoder::new(metadata_tgz_reader)).unpack(&metadata_path)?;
+
+    let config_json_path = metadata_path.join("config.json");
+    let config_file_content = fs_err::read_to_string(&config_json_path)?;
+    let pspf_config: PspConfig = serde_json::from_str(&config_file_content)?;
+    debug!("Parsed config.json: {:?}", pspf_config);
+
+    let payload_extract_path = temp_extraction_dir.path().join("payload_wheels");
+    fs_err::create_dir_all(&payload_extract_path)?;
+    pspf_file.seek(SeekFrom::Start(footer.payload_offset))?;
+    let mut payload_tgz_reader = BufReader::new(&mut pspf_file).take(footer.payload_size);
+    Archive::new(GzDecoder::new(payload_tgz_reader)).unpack(&payload_extract_path)?;
+    debug!("Extracted payload.tgz to: {}", payload_extract_path.display());
+
+    // 7. Create Environment
+    eprintln!("Creating isolated Python environment...");
+    let python_request = pspf_config.python_version.as_deref().map(PythonRequest::parse).transpose()?;
+
+    let interpreter = find_best_interpreter(
+        python_request.as_ref(),
+        EnvironmentPreference::Any, // TODO: PSPF might want specific preferences
+        PythonPreference::Default, // TODO: Make configurable or use PSPF specific setting
+        &globals_for_pspf_exec(&cache).await?, // Pass a minimal GlobalSettings like context
+        &cache,
+    ).await.context("Failed to find a suitable Python interpreter for PSPF execution.")?;
+    writeln!(printer.stdout(), "Using Python interpreter: {}", interpreter.sys_executable().user_display())?;
+
+    let venv_path = temp_extraction_dir.path().join(".pspf_venv");
+    let venv = create_virtualenv(
+        &venv_path,
+        &interpreter,
+        uv_virtualenv::Prompt::None,
+        false, // system_site_packages
+        false, // seed
+        LinkMode::default(),
+        &IndexLocations::default(),
+        &KeyringProviderType::Disabled,
+        &BuildOptions::default(),
+        Concurrency::default(),
+        &cache,
+    ).context("Failed to create virtual environment for PSPF execution")?;
+    writeln!(printer.stdout(), "Virtual environment created at: {}", venv.root().user_display())?;
+
+    let python_env = PythonEnvironment::from_virtualenv(venv);
+
+    // 8. Install Payload
+    eprintln!("Installing application payload...");
+    let requirement_sources: Vec<RequirementsSource> = fs_err::read_dir(&payload_extract_path)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().map_or(false, |ext| ext == "whl"))
+        .map(RequirementsSource::from_path)
+        .collect::<Result<Vec<_>>>()?;
+
+    if requirement_sources.is_empty() {
+        writeln!(printer.stderr(), "Warning: No wheels found in payload.tgz to install.")?;
+    } else {
+        // Simplified installation logic. This needs to mirror `uv_installer` more closely.
+        // We need to build a plan and then execute it.
+        // For now, this is a conceptual placeholder.
+        // Actual installation would involve:
+        // - A `DistributionDatabase` created with a `Client` and `Cache`.
+        // - A `Planner` to create an `InstallPlan`.
+        // - An `Installer` to execute the plan.
+        // This is complex because these components expect more context (like full settings).
+
+        // Placeholder: Iterate and try to install each wheel individually (very simplified)
+        for req_source in &requirement_sources {
+            if let RequirementsSource::Path { path, .. } = req_source {
+                 writeln!(printer.stdout(), "Attempting to install wheel: {}", path.user_display())?;
+                // This is where `uv_install_wheel::install_wheel` or similar would be used.
+                // It requires `target: &PythonEnvironment`, `reader: impl Read + Seek`, `filename: &WheelFilename`, etc.
+                // Example:
+                // let wheel_file = fs_err::File::open(path)?;
+                // let wheel_metadata = uv_distribution_types::WheelMetadata::from_wheel(wheel_file)?;
+                // uv_install_wheel::install_wheel(
+                //     &python_env,
+                //     BufReader::new(fs_err::File::open(path)?),
+                //     wheel_metadata.filename(),
+                //     &uv_install_wheel::InstallWheelOptions::default(),
+                // )?;
+            }
+        }
+        warn_user_once!("Payload installation logic is highly simplified and likely non-functional for complex cases.");
+    }
+
+    // 9. Run Application
+    eprintln!("Executing application: {}", pspf_config.entry_point);
+    let python_executable = python_env.python_executable();
+
+    // Parse entry point: module.name:object or module.name
+    // For execution, we typically use `python -m module.name`
+    let (module_path, _object_name) = if let Some(idx) = pspf_config.entry_point.rfind(':') {
+        (&pspf_config.entry_point[..idx], Some(&pspf_config.entry_point[idx+1..]))
+    } else {
+        (pspf_config.entry_point.as_str(), None)
+    };
+
+    // Replace dots with slashes for path only if it's meant to be a file path,
+    // for `python -m module.path`, it should remain dots.
+    // Assuming entry_point is a module path for `python -m`.
+
+    let mut cmd = std::process::Command::new(python_executable);
+    cmd.arg("-m");
+    cmd.arg(module_path); // e.g., "my_app.main"
+
+    // Apply environment variables from pspf_config
+    if let Some(env_vars) = pspf_config.env_vars {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
+
+    // TODO: Handle application arguments if they are to be passed through from PSPF execution.
+    // For now, no application arguments are passed.
+
+    // Set working directory? For now, defaults to current working dir of the PSPF process.
+    // cmd.current_dir(temp_extraction_dir.path()); // Or a specific app root within payload
+
+    // Execute the command
+    debug!("Running application command: {:?}", cmd);
+    let process_status = cmd.status().with_context(|| {
+        format!("Failed to execute application entry point: {}", pspf_config.entry_point)
+    })?;
+
+    if process_status.success() {
+        eprintln!("Application finished successfully.");
+        Ok(ExitStatus::Success)
+    } else {
+        eprintln!("Application exited with status: {}", process_status);
+        Ok(ExitStatus::External(process_status.code().unwrap_or(1) as u8))
+    }
 }
+
+// Helper to create a minimal GlobalSettings-like context for PSPF execution python discovery
+// This is a workaround as the full CLI context isn't available when `execute_pspf_package`
+// is called directly from `main` after PSPF detection.
+// These settings control aspects like Python discovery behavior (e.g., allowing downloads).
+async fn globals_for_pspf_exec(_cache: &Cache) -> Result<GlobalSettings> { // Cache might be needed if settings depend on it
+    // TODO: Determine how these should be configured for PSPF execution.
+    // Ideally, some of these could be influenced by `PspConfig` or fixed policies for PSPF.
+    // For example, `offline` should probably be true if the PSPF is meant to be fully self-contained
+    // after initial Python acquisition (if any).
+    // `python_downloads` behavior is critical: should a PSPF be allowed to download a Python interpreter?
+    Ok(GlobalSettings {
+        user_settings: uv_settings::UserSettings::default(),
+        python_preference: PythonPreference::Default,
+        python_downloads: uv_python::PythonDownloadsBehavior::Allow, // Or Deny if PSPF should be fully self-contained
+        no_progress: true, // Assuming no interactive progress for internal exec
+        quiet: 1, // Reduce chattiness
+        verbose: 0,
+        color: anstream::ColorChoice::Auto, // Or Never
+        native_tls: false, // Default from uv
+        offline: false, // PSPF execution should ideally not need network
+        show_settings: false,
+        required_version: None,
+        network_settings: NetworkSettings::default(),
+        concurrency: Concurrency::default(),
+        installer_metadata: true, // Or false if we don't want to write INSTALLER files
+        preview: PreviewMode::Disabled, // Or Enabled if PSPF uses preview features
+        // The following are not directly part of GlobalSettings but are usually derived or passed alongside
+        // project: None,
+        // config_file: None,
+        // no_config: true, // PSPF should be self-contained
+    })
+}
+
 
 fn check_pspf_payload() -> Option<(PspFileFooterV1, PathBuf)> {
     let current_exe_path = match std::env::current_exe() {

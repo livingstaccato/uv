@@ -16,12 +16,43 @@ use rsa::pkcs1::der::Encode; // For Encode<RsaPublicKey> to get DER bytes
 use uv_cli::PsPfPackageArgs;
 use uv_fs::Simplified; // For user_display
 
+// Need to bring PspConfig into scope if it's defined in lib.rs or elsewhere
+// For now, assuming it might be moved to pspf_format.rs or a new shared types location.
+// If it remains in lib.rs, we'd need `crate::PspConfig` and ensure lib.rs exposes it.
+// Let's assume for now we'll define/import it appropriately.
+// For this step, we will use a local definition if not easily importable, then refactor.
+use serde::Serialize; // For serializing config.json
+use std::collections::HashMap;
+use std::io::BufReader;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tar::Builder as TarBuilder;
+use tempfile::NamedTempFile;
+use sha2::{Sha256, Digest};
+use rsa::signature::{RandomizedSigner, SignatureEncoding}; // For PSS
+use rsa::pss::Pss;
+
+
 use crate::commands::ExitStatus;
 use crate::printer::Printer;
-use crate::pspf_format::{PspFileFooterV1, PSPF_EOF_MAGIC_STRING, PUBLIC_KEY_EMBED_OFFSET, PUBLIC_KEY_MAX_SIZE};
+use crate::pspf_format::{PspConfig, PspFileFooterV1, PSPF_EOF_MAGIC_STRING, PUBLIC_KEY_EMBED_OFFSET, PUBLIC_KEY_MAX_SIZE};
 
 
 /// Core logic for the `uv pspf package` command.
+///
+/// This function orchestrates the creation of a PSPF file by:
+/// 1. Determining output path and the `uv` binary to use as a base.
+/// 2. Copying the base `uv` binary to the output location.
+/// 3. Reading the provided private key, deriving the public key, and embedding the
+///    DER-encoded public key into the copied `uv` binary at a predefined offset.
+/// 4. Creating a `config.json` file with application metadata (entry point,
+///    Python version placeholder, environment variables) and packaging it into
+///    `metadata.tgz`.
+/// 5. Creating a placeholder `payload.tgz` (actual wheel bundling is a TODO).
+/// 6. Calculating a SHA-256 hash of the (uv binary + metadata.tgz + payload.tgz).
+/// 7. Signing this hash with the private key using RSA-PSS.
+/// 8. Assembling the final PSPF file by appending `metadata.tgz`, `payload.tgz`,
+///    the signature, a `PspFileFooterV1`, and the `PSPF_EOF_MAGIC_STRING`.
 pub(crate) async fn pspf_package(
     args: PsPfPackageArgs,
     printer: Printer,
@@ -142,45 +173,170 @@ pub(crate) async fn pspf_package(
 
     writeln!(printer.stdout(), "Public key ({} bytes) embedded at offset {} (padded to {} bytes).", public_key_der.len(), PUBLIC_KEY_EMBED_OFFSET, PUBLIC_KEY_MAX_SIZE)?;
 
-    // TODO: 6. Create metadata.tgz:
-    //    - config.json (entry_point, python_version, env_policies)
+    // 6. Create metadata.tgz
+    //    - config.json (entry_point, python_version, env_vars)
     //    - (Potentially other metadata files)
-    let metadata_tgz_placeholder = b"metadata_content_placeholder"; // Replace with actual tgz
-    let metadata_offset = pspf_file.seek(SeekFrom::End(0))?; // Should be uv_binary_size if key is within binary
-                                                              // Actually, uv_binary_size is fixed after copy. Appending starts after original binary content.
-                                                              // The public key is *embedded within* the uv_binary_size portion.
-                                                              // So, metadata_offset should indeed be uv_binary_size.
-    if metadata_offset != uv_binary_size {
-         // This implies the public key embed logic or uv_binary_size definition needs refinement.
-         // For now, let's assume uv_binary_size is the size of the *original* uv binary, and metadata starts after it.
-         // The "Modified uv Binary" in the diagram includes the embedded key. So its size is `uv_binary_size`.
-         // The key is written *into* this section.
-         // So, the first append (metadata.tgz) happens at `uv_binary_size`.
-        pspf_file.seek(SeekFrom::Start(uv_binary_size))?;
+
+    // Parse environment variables from args
+    let mut env_vars_map = HashMap::new();
+    for env_str in args.env {
+        if let Some((key, value)) = env_str.split_once('=') {
+            env_vars_map.insert(key.to_string(), value.to_string());
+        } else {
+            writeln!(printer.stderr(), "Warning: Ignoring malformed environment variable string: {}", env_str)?;
+        }
     }
 
-    pspf_file.write_all(metadata_tgz_placeholder)?;
-    let metadata_size = metadata_tgz_placeholder.len() as u64;
-    writeln!(printer.stdout(), "Appended placeholder metadata.tgz (size: {} bytes) at offset {}.", metadata_size, uv_binary_size)?;
+    // TODO: Python version for config.json should be detected from the project or specified via CLI.
+    // For now, it's None, and a warning is printed.
+    let python_version_for_config: Option<String> = None;
+    if python_version_for_config.is_none() {
+        writeln!(
+            printer.stderr(),
+            "{}",
+            "Warning: Python version for the packaged application is not specified. \
+            Execution will attempt to use a default Python. \
+            Future versions will allow specifying or detecting this."
+            .yellow()
+        )?;
+    }
 
+    let pspf_config = PspConfig {
+        entry_point: args.entry_point.clone(),
+        python_version: python_version_for_config,
+        env_vars: if env_vars_map.is_empty() { None } else { Some(env_vars_map) },
+    };
 
-    // TODO: 7. Create payload.tgz:
+    let config_json_bytes = serde_json::to_vec_pretty(&pspf_config)
+        .context("Failed to serialize pspf_config to JSON")?;
+
+    // Create metadata.tgz in memory (or a temp file)
+    let mut metadata_tgz_data = Vec::new();
+    let gz_encoder = GzEncoder::new(&mut metadata_tgz_data, Compression::default());
+    let mut tar_builder = TarBuilder::new(gz_encoder);
+
+    let mut header = tar::Header::new_gnu();
+    header.set_path("config.json")?;
+    header.set_size(config_json_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum(); // Calculate checksum
+    tar_builder.append(&header, config_json_bytes.as_slice())?;
+
+    // Add other metadata files here if needed in the future
+
+    tar_builder.finish()?; // Finish writing to the tar archive
+    let gz_encoder = tar_builder.into_inner()?; // Get the GzEncoder back
+    gz_encoder.finish()?; // Finish writing to the GzEncoder (writes compressed data to metadata_tgz_data)
+
+    // Append metadata.tgz to the PSPF file
+    // The current end of the file is where the uv_binary_size (with embedded key) ends.
+    pspf_file.seek(SeekFrom::Start(uv_binary_size))
+        .context("Failed to seek to metadata.tgz offset")?;
+    pspf_file.write_all(&metadata_tgz_data)
+        .context("Failed to write metadata.tgz to PSPF file")?;
+
+    let metadata_offset = uv_binary_size; // Metadata starts right after the uv_binary part
+    let metadata_size = metadata_tgz_data.len() as u64;
+    writeln!(printer.stdout(), "Appended metadata.tgz (size: {} bytes) at offset {}.", metadata_size, metadata_offset)?;
+
+    // 7. Create payload.tgz
     //    - Gather/build necessary Python wheels for the project.
-    let payload_tgz_placeholder = b"payload_content_placeholder_longer"; // Replace with actual tgz
-    let payload_offset = pspf_file.seek(SeekFrom::End(0))?;
-    pspf_file.write_all(payload_tgz_placeholder)?;
-    let payload_size = payload_tgz_placeholder.len() as u64;
-    writeln!(printer.stdout(), "Appended placeholder payload.tgz (size: {} bytes) at offset {}.", payload_size, payload_offset)?;
+    //    - This is a MAJOR TODO requiring integration with uv's resolver and wheel builder.
+    //    - For now, create a placeholder payload.tgz with a dummy wheel file.
 
-    // TODO: 8. Sign the package:
-    //    - Concatenate (uv_binary_with_embedded_key || metadata.tgz || payload.tgz).
-    //    - Hash the concatenation (SHA-256).
-    //    - Sign the hash with args.private_key (RSA-PSS).
-    let signature_placeholder = b"signature_placeholder_even_longer"; // Replace with actual signature
-    let signature_offset = pspf_file.seek(SeekFrom::End(0))?;
-    pspf_file.write_all(signature_placeholder)?;
-    let signature_size = signature_placeholder.len() as u64;
-    writeln!(printer.stdout(), "Appended placeholder signature (size: {} bytes) at offset {}.", signature_size, signature_offset)?;
+    writeln!(printer.stdout(), "Starting payload creation (currently placeholder)...")?;
+
+    // Placeholder: Simulate having a list of wheel files.
+    // In reality, this list would come from resolving and fetching/building project dependencies.
+    let temp_payload_dir = tempfile::tempdir()
+        .context("Failed to create temporary directory for payload wheels")?;
+
+    let dummy_wheel_name = "dummy_package-1.0-py3-none-any.whl";
+    let dummy_wheel_path = temp_payload_dir.path().join(dummy_wheel_name);
+    let mut dummy_wheel_file = File::create(&dummy_wheel_path)
+        .context("Failed to create dummy wheel file")?;
+    dummy_wheel_file.write_all(b"This is a dummy wheel file content.")
+        .context("Failed to write to dummy wheel file")?;
+
+    let wheel_files_to_package: Vec<PathBuf> = vec![dummy_wheel_path];
+    // TODO: Replace above with actual logic:
+    // let project_workspace = uv_workspace::Workspace::discover(&args.project_path, &uv_workspace::DiscoveryOptions::default()).await
+    //    .context("Failed to discover workspace for project.")?;
+    // let requirements = ... extract from project_workspace ...
+    // let resolved_wheels = ... resolve requirements using uv_resolver ... (needs Cache, Python env info etc.)
+    // let wheel_files_to_package = ... fetch/build wheels from resolved_wheels ... (needs uv_distribution, uv_installer)
+
+    let mut payload_tgz_data = Vec::new();
+    let gz_encoder_payload = GzEncoder::new(&mut payload_tgz_data, Compression::default());
+    let mut tar_builder_payload = TarBuilder::new(gz_encoder_payload);
+
+    for wheel_path in &wheel_files_to_package {
+        let wheel_filename = wheel_path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("Failed to get filename from wheel path: {}", wheel_path.display()))?
+            .to_string_lossy();
+
+        tar_builder_payload.append_path_with_name(wheel_path, &*wheel_filename)
+            .with_context(|| format!("Failed to add wheel {} to payload.tgz", wheel_path.display()))?;
+        debug!("Added {} to payload.tgz", wheel_filename);
+    }
+
+    tar_builder_payload.finish()?;
+    let gz_encoder_payload = tar_builder_payload.into_inner()?;
+    gz_encoder_payload.finish()?;
+
+    // Append payload.tgz to the PSPF file
+    pspf_file.seek(SeekFrom::Start(metadata_offset + metadata_size))
+        .context("Failed to seek to payload.tgz offset")?;
+    pspf_file.write_all(&payload_tgz_data)
+        .context("Failed to write payload.tgz to PSPF file")?;
+
+    let payload_offset = metadata_offset + metadata_size;
+    let payload_size = payload_tgz_data.len() as u64;
+    writeln!(printer.stdout(), "Appended payload.tgz (size: {} bytes) at offset {}.", payload_size, payload_offset)?;
+
+    temp_payload_dir.close().context("Failed to clean up temporary payload directory")?;
+
+    // 8. Sign the package
+    // This involves hashing the (modified uv binary + metadata.tgz + payload.tgz)
+    // and then signing that hash with the private key.
+    writeln!(printer.stdout(), "Signing the package...")?;
+    let mut hasher = Sha256::new();
+
+    // Hash uv_binary_portion (from the beginning of the file up to uv_binary_size)
+    // This part now includes the embedded public key.
+    pspf_file.seek(SeekFrom::Start(0))
+        .context("Failed to seek to start of PSPF file for signing hash")?;
+    let mut binary_reader = BufReader::new(&mut pspf_file).take(uv_binary_size);
+    std::io::copy(&mut binary_reader, &mut hasher)
+        .context("Failed to hash uv binary content for signing")?;
+    drop(binary_reader); // Release borrow of pspf_file
+
+    // Hash metadata.tgz (already in memory in metadata_tgz_data)
+    hasher.update(&metadata_tgz_data);
+
+    // Hash payload.tgz (already in memory in payload_tgz_data)
+    hasher.update(&payload_tgz_data);
+
+    let digest_to_sign = hasher.finalize();
+    debug!("Digest to sign: {:x}", digest_to_sign);
+
+    // Sign the hash with the private key using RSA-PSS
+    // The private_key was loaded earlier during public key embedding.
+    let mut rng = rand::thread_rng();
+    let padding_scheme = Pss::new::<Sha256>();
+    let signature_bytes = private_key.sign_with_rng(&mut rng, padding_scheme, &digest_to_sign)
+        .map_err(|e| anyhow::anyhow!("Failed to sign data with RSA-PSS: {}", e))?
+        .to_vec();
+
+    // Append signature to the PSPF file
+    pspf_file.seek(SeekFrom::Start(payload_offset + payload_size))
+        .context("Failed to seek to signature offset")?;
+    pspf_file.write_all(&signature_bytes)
+        .context("Failed to write signature to PSPF file")?;
+
+    let signature_offset = payload_offset + payload_size;
+    let signature_size = signature_bytes.len() as u64;
+    writeln!(printer.stdout(), "Appended signature (size: {} bytes) at offset {}.", signature_size, signature_offset)?;
 
     // 9. Assemble final PSPF file (continued):
     //    - PspFileFooterV1 (populated with correct offsets and sizes)
@@ -209,4 +365,127 @@ pub(crate) async fn pspf_package(
     writeln!(printer.stdout(), "PSPF package created successfully: {}", output_path.user_display())?;
 
     Ok(ExitStatus::Success)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use crate::pspf_format::PspConfig; // Assuming PspConfig might be moved/exposed from pspf_format or lib for testing
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use rsa::pkcs1::der::{DecodeRsaPrivateKey, Encode};
+    use rsa::signature::{RandomizedSigner, Verifier, SignatureEncoding};
+    use rsa::pss::Pss;
+    use sha2::{Sha256, Digest};
+    use rand::rngs::OsRng; // For key generation and signing
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    // Helper to create a new PspConfig for package tests
+    // Note: This is distinct from the PspConfig in lib.rs used for deserialization during execution.
+    // This one uses Serialize.
+    fn new_test_pspf_config_for_package() -> PspConfigForPackage {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("TEST_KEY".to_string(), "TEST_VALUE".to_string());
+        PspConfigForPackage {
+            entry_point: "test_module.main:run".to_string(),
+            python_version: Some("3.10".to_string()),
+            env_vars: Some(env_vars),
+        }
+    }
+
+    #[test]
+    fn test_psp_config_serialization() {
+        let config = new_test_pspf_config_for_package();
+        let json_bytes = serde_json::to_vec_pretty(&config).unwrap();
+        let json_string = String::from_utf8(json_bytes).unwrap();
+
+        // Basic check for key fields
+        assert!(json_string.contains("\"entry_point\": \"test_module.main:run\""));
+        assert!(json_string.contains("\"python_version\": \"3.10\""));
+        assert!(json_string.contains("\"TEST_KEY\": \"TEST_VALUE\""));
+    }
+
+    #[test]
+    fn test_metadata_tgz_creation_and_extraction() -> Result<()> {
+        let config = new_test_pspf_config_for_package();
+        let config_json_bytes = serde_json::to_vec_pretty(&config)
+            .context("Test: Failed to serialize pspf_config to JSON")?;
+
+        let mut metadata_tgz_data = Vec::new();
+        let gz_encoder = GzEncoder::new(&mut metadata_tgz_data, Compression::default());
+        let mut tar_builder = TarBuilder::new(gz_encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path("config.json")?;
+        header.set_size(config_json_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder.append(&header, config_json_bytes.as_slice())?;
+        tar_builder.finish()?;
+        let gz_encoder = tar_builder.into_inner()?;
+        gz_encoder.finish()?;
+
+        // Now, extract and verify
+        let mut extracted_config_json_bytes = Vec::new();
+        let tar = GzDecoder::new(Cursor::new(metadata_tgz_data));
+        let mut archive = Archive::new(tar);
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            if entry.path()?.to_string_lossy() == "config.json" {
+                entry.read_to_end(&mut extracted_config_json_bytes)?;
+                break;
+            }
+        }
+
+        assert_eq!(config_json_bytes, extracted_config_json_bytes, "Extracted config.json does not match original");
+
+        // Also deserialize and check struct
+        let extracted_config_str = String::from_utf8(extracted_config_json_bytes)?;
+        let deserialized_config: PspConfigForPackage = serde_json::from_str(&extracted_config_str)?;
+
+        assert_eq!(config.entry_point, deserialized_config.entry_point);
+        assert_eq!(config.python_version, deserialized_config.python_version);
+        assert_eq!(config.env_vars, deserialized_config.env_vars);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rsa_pss_sign_verify_roundtrip() -> Result<()> {
+        let mut rng = OsRng;
+        let bits = 2048; // Standard size for testing
+        let private_key = RsaPrivateKey::new(&mut rng, bits)
+            .context("Failed to generate RSA private key")?;
+        let public_key = private_key.to_public_key();
+
+        let data_to_sign = b"this is some data to sign for the PSPF test";
+        let mut hasher = Sha256::new();
+        hasher.update(data_to_sign);
+        let hashed_data = hasher.finalize();
+
+        let padding_scheme = Pss::new::<Sha256>();
+
+        let signature = private_key.sign_with_rng(&mut rng, padding_scheme.clone(), &hashed_data)
+            .map_err(|e| anyhow::anyhow!("RSA-PSS signing failed: {}",e))?
+            .to_vec();
+
+        public_key.verify(padding_scheme, &hashed_data, &signature)
+            .context("RSA-PSS signature verification failed")?;
+
+        Ok(())
+    }
+
+    // TODO: Add integration-style test for pspf_package function itself,
+    // mocking file system ops or using temp dirs to verify output structure.
+    // This would involve:
+    // 1. Generating a key pair.
+    // 2. Setting up PsPfPackageArgs.
+    // 3. Calling pspf_package (may need to be refactored for testability if it directly uses std::env::current_exe).
+    // 4. Opening the output PSPF file.
+    // 5. Reading footer, checking magic string.
+    // 6. Extracting and verifying embedded public key.
+    // 7. Extracting and verifying metadata.tgz and config.json.
+    // 8. Verifying signature over (uv_bin_part + metadata.tgz + dummy_payload.tgz).
 }

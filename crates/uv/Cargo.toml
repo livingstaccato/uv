@@ -106,6 +106,7 @@ rsa = { workspace = true, features = ["sha2"] } # For RSA signing and key manipu
 sha2 = { workspace = true } # For SHA256 hashing
 tar = { workspace = true } # For creating tarballs
 # flate2 is already a workspace dependency, but ensure it's available for gzip
+rand = { workspace = true } # For RSA-PSS signing
 url = { workspace = true }
 version-ranges = { workspace = true }
 walkdir = { workspace = true }

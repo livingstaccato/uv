@@ -65,6 +65,34 @@ pub struct PspFileFooterV1 {
 }
 
 // Statically assert the size of the footer structure.
+
+/// Configuration for the PSPF package, stored in `metadata.tgz/config.json`.
+/// Used for both serialization during packaging and deserialization during execution.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct PspConfig {
+    /// The application entry point, defining what to run.
+    /// Examples:
+    /// - "module.main:run" (interpreted as `python -m module.main`)
+    /// - "my_script.py" (if the payload were to support direct script paths)
+    pub entry_point: String,
+
+    /// The target Python version for the application (e.g., "3.9", "3.10.4").
+    /// If `None`, the PSPF execution will attempt to find a suitable default Python.
+    /// This version informs the Python interpreter selection for the temporary virtual environment.
+    pub python_version: Option<String>,
+
+    /// A map of environment variables to be set before running the application.
+    /// These variables will be available to the executed Python process.
+    pub env_vars: Option<std::collections::HashMap<String, String>>,
+
+    // TODO: Consider adding a 'uv_tool_version_constraint' field if PSPFs should
+    // require a specific range of `uv` versions to execute them.
+    // TODO: Consider adding 'platform_compatibility' markers if a PSPF is
+    // platform-specific (though ideally payload wheels handle this).
+}
+
+
+impl PspFileFooterV1 {
 // This requires an external crate like `static_assertions`.
 // const _: () = assert!(std::mem::size_of::<PspFileFooterV1>() == 64, "PspFileFooterV1 must be 64 bytes");
 // For now, we use a runtime check or a constant.
